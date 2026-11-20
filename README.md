@@ -53,6 +53,43 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | DELETE | `/superpositions/{id}` | 撤销叠压并重算 |
 | GET | `/sites/{id}/solution` | 整站分组、组间边、各组全部可行年代段 |
 | GET | `/strata/{id}/correlation-view` | 按原始层位查同组成员与可行年代段 |
+| GET | `/sites/{id}/label-versions` | 号表版本列表（含现行版 `is_current`） |
+| GET | `/sites/{id}/label-versions/{version}` | 某一历史版号表的完整编号 |
+| POST | `/sites/{id}/label-versions/renumber?version=N` | 提交一批层位改号，成功当次返回新版号 |
+| GET | `/sites/{id}/labels?version=N&trench=T1&layer_no=L2` | 按版号 + 探方 + 层号查当时层位及现层号 |
+
+## 号表（标签）与批量改号
+
+样袋上印的是归档当时的探方与层号；整理时同一探方内的若干层号可能需要（部分）
+对调。系统为每个遗址维护一条只增不减的**号表版本链**：
+
+- 库中该遗址首次出现层位时，以现有编号建立第 1 版（初版）；旧库升级后首次
+  启动时，同样以现有编号补建初版。
+- 每次**新增层位**成功即生成新一版号表；每次**批量改号**成功也生成新一版。
+  两处均按提交顺序在同一事务内生效，返回当次新版号。
+- 版本表是整表快照（层位 id ↔ 探方/层号）。层位 id、年代段、对接与叠压关系
+  始终指向原层位，改号只改标签，不改变分组与年代结论。
+- 批量改号只作用于一个探方：**按整批改完后的结果**检查该探方内是否重号，
+  因此批内互换（如 L2/L3 对调）合法；改完仍有重号则整批拒绝。
+- 提交时必须带上查询到的现行版号：版号过期、改完仍有重号或写入失败时返回
+  `409`（`reason` 分别为 `STALE_LABEL_VERSION` / `DUPLICATE_LAYER_NO` /
+  `LABEL_WRITE_FAILED`），现行号表与历史均保持原样。
+- 历史版号永久可查，重启后依然有效；按旧版号查询层号时，即使该旧号现在已
+  给另一层使用，也会按版号快照返回原层位，并附上它现在的层号。
+
+```bash
+# 查看现行版号
+curl localhost:8000/sites/1/label-versions
+# 在现行版 v1 上把 T1 的 L2/L3 对调（整批提交，按改完后的结果查重号）
+curl -X POST 'localhost:8000/sites/1/label-versions/renumber?version=1' \
+  -H 'Content-Type: application/json' -d '{
+    "trench": "T1",
+    "entries": [{"stratum_id": 5, "layer_no": "L3"},
+                {"stratum_id": 6, "layer_no": "L2"}]
+  }'
+# 按归档时的版号查样袋号：即使旧号已给另一层使用，仍返回原层位
+curl 'localhost:8000/sites/1/labels?version=1&trench=T1&layer_no=L2'
+```
 
 ### 录入示例
 

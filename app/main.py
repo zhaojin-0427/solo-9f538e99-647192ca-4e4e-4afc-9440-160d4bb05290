@@ -8,15 +8,17 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import threading
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
-from . import db
+from . import db, labels
 from .schemas import (
     CorrelationCreate,
+    RenumberRequest,
     SiteCreate,
     StratumCreate,
     SuperpositionCreate,
@@ -151,6 +153,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     row = db.create_stratum(
                         conn, site_id, body.trench, body.layer_no, body.note, intervals
                     )
+                    label_version = labels.record_new_stratum(conn, site_id)
                     db.bump_version(conn)
                     if not load_and_solve(conn, site_id).feasible:
                         _reject_infeasible(
@@ -167,6 +170,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 )
             return {
                 "record": serialize_stratum(conn, row),
+                "label_version": label_version,
                 "solution": _solution_payload(site_id),
             }
 
@@ -181,6 +185,158 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if row is None:
             raise HTTPException(404, f"层位 {stratum_id} 不存在")
         return serialize_stratum(conn, row)
+
+    # ---------- 号表（标签）版本 ----------
+
+    @app.get("/sites/{site_id}/label-versions", tags=["labels"])
+    def list_label_versions(site_id: int):
+        """该遗址全部号表版本（含现行版）。"""
+        _require_site(site_id)
+        current = db.get_current_label_version(conn, site_id)
+        return [
+            {
+                "site_id": site_id,
+                "version": r["version"],
+                "created": r["created"],
+                "is_current": r["version"] == current,
+            }
+            for r in db.list_label_versions(conn, site_id)
+        ]
+
+    @app.post("/sites/{site_id}/label-versions/renumber", tags=["labels"])
+    def renumber_trench(
+        site_id: int, body: RenumberRequest, version: int | None = None
+    ):
+        """按指定版号提交一批层位改号；成功当次返回新版号。
+
+        提交的现行版号可用查询参数 ``version`` 给出，也可放在请求体
+        ``label_version`` 中（二者都给时必须一致）。请求体另给出探方与该批
+        层位的新层号。按整批改完后的结果检查该探方内重号，允许互换。
+        版号过期、改完仍有重号或写入失败时，现行号表和历史均保持原样。
+        """
+        _require_site(site_id)
+        submitted = version if version is not None else body.label_version
+        if submitted is None:
+            raise HTTPException(
+                422, "缺少号表版号：请在查询参数 version 或请求体 label_version 中给出"
+            )
+        if (
+            version is not None
+            and body.label_version is not None
+            and version != body.label_version
+        ):
+            raise HTTPException(
+                422, "查询参数 version 与请求体 label_version 不一致"
+            )
+        entries = [(e.stratum_id, e.layer_no) for e in body.entries]
+        with write_lock:
+            try:
+                plan = labels.plan_renumber(
+                    conn, site_id, submitted, body.trench, entries
+                )
+            except labels.StaleLabelVersion as exc:
+                raise ConflictError(
+                    str(exc),
+                    {
+                        "reason": "STALE_LABEL_VERSION",
+                        "submitted_version": exc.submitted,
+                        "current_version": exc.current,
+                    },
+                )
+            except labels.RenumberConflict as exc:
+                raise ConflictError(
+                    str(exc),
+                    {
+                        "reason": exc.reason,
+                        "current_version": db.get_current_label_version(
+                            conn, site_id
+                        ),
+                    },
+                )
+            try:
+                with db.transaction(conn):
+                    new_version = labels.apply_renumber(conn, plan)
+                    db.bump_version(conn)
+            except (sqlite3.Error, labels.StaleLabelVersion, labels.RenumberConflict):
+                # 写入失败：事务已回滚，号表版本与层位编号均回到提交前
+                raise ConflictError(
+                    "改号写入失败，现行号表与历史均未改变",
+                    {
+                        "reason": "LABEL_WRITE_FAILED",
+                        "current_version": db.get_current_label_version(
+                            conn, site_id
+                        ),
+                    },
+                )
+            return {
+                "site_id": site_id,
+                "label_version": new_version,
+                "trench": body.trench,
+                "entries": [
+                    {
+                        "stratum_id": sid,
+                        "layer_no": layer_no,
+                        "label_version": new_version,
+                    }
+                    for sid, layer_no in entries
+                ],
+            }
+
+    @app.get("/sites/{site_id}/label-versions/{version}", tags=["labels"])
+    def get_label_version(site_id: int, version: int):
+        """某一历史版号表的完整编号（版号过期后仍可查）。"""
+        _require_site(site_id)
+        head = db.get_label_version_row(conn, site_id, version)
+        if head is None:
+            raise HTTPException(
+                404, f"遗址 {site_id} 不存在号表版号 {version}"
+            )
+        current = db.get_current_label_version(conn, site_id)
+        return {
+            "site_id": site_id,
+            "version": version,
+            "created": head["created"],
+            "is_current": version == current,
+            "entries": [
+                {
+                    "stratum_id": r["stratum_id"],
+                    "trench": r["trench"],
+                    "layer_no": r["layer_no"],
+                }
+                for r in db.list_label_entries(conn, site_id, version)
+            ],
+        }
+
+    @app.get("/sites/{site_id}/labels", tags=["labels"])
+    def lookup_label(
+        site_id: int, version: int, trench: str, layer_no: str
+    ):
+        """按遗址 + 标签版号 + 探方 + 层号，返回当时对应的层位及其现层号。
+
+        即使该旧层号后来已给另一层使用，也按版号快照返回原层位。
+        """
+        _require_site(site_id)
+        head = db.get_label_version_row(conn, site_id, version)
+        if head is None:
+            raise HTTPException(404, f"遗址 {site_id} 不存在号表版号 {version}")
+        entry = db.find_label_at(conn, site_id, version, trench, layer_no)
+        if entry is None:
+            raise HTTPException(
+                404, f"版号 {version} 的探方 {trench} 中没有层号 {layer_no!r}"
+            )
+        stratum_id = entry["stratum_id"]
+        stratum = db.get_stratum(conn, stratum_id)
+        current_version = db.get_current_label_version(conn, site_id)
+        return {
+            "site_id": site_id,
+            "label_version": version,
+            "trench": trench,
+            "layer_no": layer_no,
+            "stratum_id": stratum_id,
+            "current_layer_no": stratum["layer_no"] if stratum else None,
+            "current_trench": stratum["trench"] if stratum else None,
+            "current_label_version": current_version,
+        }
 
     # ---------- 对接 ----------
 

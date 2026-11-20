@@ -61,10 +61,34 @@ CREATE TABLE IF NOT EXISTS superpositions (
     UNIQUE (site_id, lower_id, upper_id)
 );
 
+-- 号表（标签）版本：每个遗址从 0 开始；每次新增层位或批量改号成功，
+-- 版本号 +1，并把当时的整张（探方, 层号）表完整快照到 label_entries。
+CREATE TABLE IF NOT EXISTS label_versions (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id INTEGER NOT NULL REFERENCES sites(id),
+    version INTEGER NOT NULL,
+    created TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (site_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS label_entries (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id    INTEGER NOT NULL REFERENCES sites(id),
+    version    INTEGER NOT NULL,
+    stratum_id INTEGER NOT NULL REFERENCES strata(id),
+    trench     TEXT NOT NULL,
+    layer_no   TEXT NOT NULL,
+    UNIQUE (site_id, version, stratum_id),
+    UNIQUE (site_id, version, trench, layer_no)
+);
+
 CREATE INDEX IF NOT EXISTS idx_strata_site ON strata(site_id);
 CREATE INDEX IF NOT EXISTS idx_intervals_stratum ON stratum_intervals(stratum_id);
 CREATE INDEX IF NOT EXISTS idx_corr_site ON correlations(site_id);
 CREATE INDEX IF NOT EXISTS idx_sup_site ON superpositions(site_id);
+CREATE INDEX IF NOT EXISTS idx_label_versions_site ON label_versions(site_id);
+CREATE INDEX IF NOT EXISTS idx_label_entries_lookup
+    ON label_entries(site_id, version, trench, layer_no);
 """
 
 
@@ -84,6 +108,28 @@ def init_db(conn: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO meta(key, value) VALUES ('version', '0')"
     )
     conn.commit()
+    bootstrap_legacy_labels(conn)
+
+
+def bootstrap_legacy_labels(conn: sqlite3.Connection) -> None:
+    """旧库升级：已有层位但尚无任何号表时，以现有编号建立第 1 版。"""
+    sites = conn.execute(
+        "SELECT s.id FROM sites s "
+        "WHERE EXISTS (SELECT 1 FROM strata st WHERE st.site_id = s.id) "
+        "AND NOT EXISTS (SELECT 1 FROM label_versions lv WHERE lv.site_id = s.id) "
+        "ORDER BY s.id"
+    ).fetchall()
+    if not sites:
+        return
+    # BEGIN IMMEDIATE 防止多进程同时启动时重复建初版
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for site in sites:
+            snapshot_labels(conn, site["id"], 1)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 @contextmanager
@@ -286,3 +332,118 @@ def list_superpositions(
 
 def delete_superposition(conn: sqlite3.Connection, superposition_id: int) -> None:
     conn.execute("DELETE FROM superpositions WHERE id = ?", (superposition_id,))
+
+
+# ---------- 号表（标签）版本 ----------
+
+def get_current_label_version(
+    conn: sqlite3.Connection, site_id: int
+) -> Optional[int]:
+    row = conn.execute(
+        "SELECT MAX(version) AS v FROM label_versions WHERE site_id = ?",
+        (site_id,),
+    ).fetchone()
+    return row["v"]
+
+
+def next_label_version(conn: sqlite3.Connection, site_id: int) -> int:
+    """下一版号；没有任何版本时初版为 1。只计算，不写入。"""
+    current = get_current_label_version(conn, site_id)
+    return 1 if current is None else current + 1
+
+
+def snapshot_labels(
+    conn: sqlite3.Connection, site_id: int, version: int
+) -> None:
+    """把层位表当前的（探方, 层号）整表快照为该遗址的某一版号表。"""
+    conn.execute(
+        "INSERT INTO label_versions(site_id, version) VALUES (?, ?)",
+        (site_id, version),
+    )
+    conn.execute(
+        "INSERT INTO label_entries(site_id, version, stratum_id, trench, layer_no) "
+        "SELECT site_id, ?, id, trench, layer_no FROM strata WHERE site_id = ?",
+        (version, site_id),
+    )
+
+
+def get_label_version_row(    conn: sqlite3.Connection, site_id: int, version: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM label_versions WHERE site_id = ? AND version = ?",
+        (site_id, version),
+    ).fetchone()
+
+
+def get_label_entry_at(
+    conn: sqlite3.Connection, site_id: int, version: int, stratum_id: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM label_entries "
+        "WHERE site_id = ? AND version = ? AND stratum_id = ?",
+        (site_id, version, stratum_id),
+    ).fetchone()
+
+
+def get_current_label_entry(
+    conn: sqlite3.Connection, site_id: int, stratum_id: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT le.* FROM label_entries le "
+        "JOIN (SELECT MAX(version) AS v FROM label_versions WHERE site_id = ?) cur "
+        "  ON le.version = cur.v "
+        "WHERE le.site_id = ? AND le.stratum_id = ?",
+        (site_id, site_id, stratum_id),
+    ).fetchone()
+
+
+def find_label_at(
+    conn: sqlite3.Connection, site_id: int, version: int, trench: str, layer_no: str
+) -> Optional[sqlite3.Row]:
+    """某版号表中某个（探方, 层号）对应的层位。"""
+    return conn.execute(
+        "SELECT * FROM label_entries "
+        "WHERE site_id = ? AND version = ? AND trench = ? AND layer_no = ?",
+        (site_id, version, trench, layer_no),
+    ).fetchone()
+
+
+def label_pairs_in_trench(
+    conn: sqlite3.Connection, site_id: int, version: int, trench: str
+) -> dict[str, int]:
+    """某版号表中某探方全部（层号 -> 层位 id）。"""
+    rows = conn.execute(
+        "SELECT layer_no, stratum_id FROM label_entries "
+        "WHERE site_id = ? AND version = ? AND trench = ?",
+        (site_id, version, trench),
+    ).fetchall()
+    return {r["layer_no"]: r["stratum_id"] for r in rows}
+
+
+def list_label_versions(
+    conn: sqlite3.Connection, site_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM label_versions WHERE site_id = ? ORDER BY version",
+        (site_id,),
+    ).fetchall()
+
+
+def list_label_entries(
+    conn: sqlite3.Connection, site_id: int, version: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM label_entries "
+        "WHERE site_id = ? AND version = ? ORDER BY trench, layer_no, stratum_id",
+        (site_id, version),
+    ).fetchall()
+
+
+def rename_stratum(
+    conn: sqlite3.Connection, stratum_id: int, trench: str, layer_no: str
+) -> None:
+    """只改物理层位的探方/层号（批量换号时经临时占位名避免互换冲突）。"""
+    conn.execute(
+        "UPDATE strata SET trench = ?, layer_no = ? WHERE id = ?",
+        (trench, layer_no, stratum_id),
+    )

@@ -124,3 +124,38 @@ class WriteResult(BaseModel):
 
     record: dict
     solution: SolutionOut
+
+
+# ---------- 号表（标签）版本 ----------
+
+class RenumberEntry(BaseModel):
+    stratum_id: int = Field(..., description="层位 id")
+    layer_no: str = Field(
+        ..., min_length=1, max_length=60, description="该层位在本探方的新层号"
+    )
+
+
+class RenumberRequest(BaseModel):
+    label_version: Optional[int] = Field(
+        None,
+        description="提交时所依据的现行号表版号；也可用查询参数 version 传入",
+    )
+    trench: str = Field(..., min_length=1, max_length=60, description="探方编号")
+    entries: list[RenumberEntry] = Field(
+        ...,
+        min_length=1,
+        description="该探方一批层位及其新层号；按整批改完后的结果检查重号，允许互换",
+    )
+
+
+class LabelLookupOut(BaseModel):
+    site_id: int
+    label_version: int
+    trench: str
+    layer_no: str
+    stratum_id: int
+    current_layer_no: str = Field(
+        ..., description="该层位现在的层号（可能已被后续改号换掉）"
+    )
+    current_trench: str
+    current_label_version: int
